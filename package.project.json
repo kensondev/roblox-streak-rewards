@@ -1,0 +1,15 @@
+{
+  "name": "StreakRewards",
+  "tree": {
+    "$className": "Folder",
+    "Shared": { "$path": "src/Shared" },
+    "Server": { "$path": "src/Server" },
+    "Client": { "$path": "src/Client" },
+    "INSTALL": {
+      "$className": "StringValue",
+      "$properties": {
+        "Value": "StreakRewards 1.0.0 | Move Shared into ReplicatedStorage > Folder named StreakRewards. Move Server into ServerScriptService and rename StreakRewardsServer. Move Client into StarterPlayer > StarterPlayerScripts and rename StreakRewardsClient. Delete this package wrapper after moving folders. No Installer Script runs. Read README.md for persistence, configuration, reward delivery and the MIT license."
+      }
+    }
+  }
+}

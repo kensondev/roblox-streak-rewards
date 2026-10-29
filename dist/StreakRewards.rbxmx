@@ -1,0 +1,1659 @@
+<roblox version="4">
+  <Item class="Folder" referent="0">
+    <Properties>
+      <string name="Name">StreakRewards</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">Client</string>
+      </Properties>
+      <Item class="LocalScript" referent="2">
+        <Properties>
+          <string name="Name">Bootstrap</string>
+          <string name="Source"><![CDATA[--!strict
+
+local controllerModule = script.Parent:WaitForChild("Controller", 10)
+if not controllerModule or not controllerModule:IsA("ModuleScript") then
+	warn("StreakRewards client Controller was not found within 10 seconds.")
+	return
+end
+
+local Controller = require(controllerModule)
+Controller.Start()
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Controller</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local GuiService = game:GetService("GuiService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+
+export type Handle = {
+	Open: () -> (),
+	Close: () -> (),
+	Destroy: () -> (),
+}
+
+type Reward = {
+	kind: "Attribute" | "Leaderstats" | "Custom",
+	name: string,
+	amount: number,
+	label: string,
+}
+
+type ClientConfig = {
+	CycleLength: number,
+	CycleMode: "Loop" | "Cap",
+	NotifyOnJoin: boolean,
+	Rewards: { Reward },
+	RemoteCooldownSeconds: number,
+}
+
+type StatePacket = {
+	canClaim: boolean,
+	nextClaimAt: number,
+	newStreak: number,
+	rewardIndex: number,
+	streakBroken: boolean,
+	streak: number,
+	serverTime: number,
+	message: string?,
+}
+
+type RemoteNames = {
+	Folder: string,
+	ClaimRequest: string,
+	StateRequest: string,
+	StateUpdate: string,
+}
+
+type DayCard = {
+	frame: Frame,
+	status: TextLabel,
+	stroke: UIStroke,
+}
+
+local WAIT_SECONDS = 10
+local RESPONSE_SECONDS = 12
+local TOGGLE_ACTION = "StreakRewards.Toggle"
+local CLOSE_ACTION = "StreakRewards.Close"
+local CLAIM_ACTION = "StreakRewards.Claim"
+local COLORS = {
+	panel = Color3.fromRGB(20, 27, 43),
+	card = Color3.fromRGB(32, 42, 61),
+	text = Color3.fromRGB(242, 246, 255),
+	muted = Color3.fromRGB(183, 196, 219),
+	accent = Color3.fromRGB(84, 159, 255),
+	ready = Color3.fromRGB(93, 223, 162),
+	warning = Color3.fromRGB(255, 199, 108),
+}
+
+local Controller = {}
+local current: Handle? = nil
+
+local function rounded(parent: GuiObject, radius: number)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(radius, 0)
+	corner.Parent = parent
+end
+
+local function text(
+	parent: Instance,
+	name: string,
+	value: string,
+	position: UDim2,
+	size: UDim2,
+	maximum: number
+): TextLabel
+	local label = Instance.new("TextLabel")
+	label.Name = name
+	label.BackgroundTransparency = 1
+	label.Position = position
+	label.Size = size
+	label.Font = Enum.Font.GothamMedium
+	label.Text = value
+	label.TextColor3 = COLORS.text
+	label.TextScaled = true
+	label.TextWrapped = true
+	local bounds = Instance.new("UITextSizeConstraint")
+	bounds.MinTextSize = 11
+	bounds.MaxTextSize = maximum
+	bounds.Parent = label
+	label.Parent = parent
+	return label
+end
+
+local function button(parent: Instance, name: string, value: string, position: UDim2, size: UDim2): TextButton
+	local result = Instance.new("TextButton")
+	result.Name = name
+	result.Position = position
+	result.Size = size
+	result.BackgroundColor3 = COLORS.accent
+	result.BorderSizePixel = 0
+	result.Font = Enum.Font.GothamBold
+	result.Text = value
+	result.TextColor3 = COLORS.panel
+	result.TextScaled = true
+	result.TextWrapped = true
+	result.Selectable = true
+	result.AutoButtonColor = true
+	local bounds = Instance.new("UITextSizeConstraint")
+	bounds.MinTextSize = 12
+	bounds.MaxTextSize = 20
+	bounds.Parent = result
+	rounded(result, 0.18)
+	result.Parent = parent
+	return result
+end
+
+local function clockText(seconds: number): string
+	local remaining = math.max(0, math.ceil(seconds))
+	local hours = math.floor(remaining / 3600)
+	local minutes = math.floor(remaining % 3600 / 60)
+	local secs = remaining % 60
+	return string.format("%02d:%02d:%02d", hours, minutes, secs)
+end
+
+function Controller.Start(): Handle?
+	if current then
+		return current
+	end
+	local player = Players.LocalPlayer
+	if not player then
+		warn("StreakRewards client must run from a LocalScript.")
+		return nil
+	end
+	local playerGui = player:WaitForChild("PlayerGui", WAIT_SECONDS)
+	if not playerGui or not playerGui:IsA("PlayerGui") then
+		warn("StreakRewards could not find PlayerGui within 10 seconds.")
+		return nil
+	end
+
+	local connections: { RBXScriptConnection } = {}
+	local destroyed = false
+	local manualInteraction = false
+	local opened = false
+	local pending = false
+	local requestVersion = 0
+	local lastRequestAt = -math.huge
+	local cooldown = 0.75
+	local clockOffset = 0
+	local state: StatePacket? = nil
+	local config: ClientConfig? = nil
+	local claimRemote: RemoteEvent? = nil
+	local stateRemote: RemoteEvent? = nil
+	local previousSelection: GuiObject? = nil
+	local cards: { DayCard } = {}
+	local feedback = "Connecting to daily rewards..."
+	local feedbackIsError = false
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "StreakRewards"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 20
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
+	gui.ClipToDeviceSafeArea = true
+
+	local backdrop = Instance.new("Frame")
+	backdrop.Name = "Backdrop"
+	backdrop.BackgroundColor3 = Color3.new(0, 0, 0)
+	backdrop.BackgroundTransparency = 0.35
+	backdrop.BorderSizePixel = 0
+	backdrop.Size = UDim2.fromScale(1, 1)
+	backdrop.Visible = false
+	backdrop.Active = true
+	backdrop.Parent = gui
+
+	local panel = Instance.new("Frame")
+	panel.Name = "Calendar"
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.Position = UDim2.fromScale(0.5, 0.5)
+	panel.Size = UDim2.fromScale(0.94, 0.92)
+	panel.BackgroundColor3 = COLORS.panel
+	panel.BorderSizePixel = 0
+	panel.SelectionGroup = true
+	rounded(panel, 0.035)
+	local limit = Instance.new("UISizeConstraint")
+	limit.MaxSize = Vector2.new(720, 650)
+	limit.Parent = panel
+	local scale = Instance.new("UIScale")
+	scale.Scale = 1
+	scale.Parent = panel
+	panel.Parent = backdrop
+
+	local title = text(panel, "Title", "DAILY REWARDS", UDim2.fromScale(0.055, 0.035), UDim2.fromScale(0.74, 0.065), 27)
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	local close = button(panel, "Close", "X", UDim2.fromScale(0.86, 0.025), UDim2.fromScale(0.1, 0.075))
+	close.BackgroundColor3 = COLORS.card
+	close.TextColor3 = COLORS.text
+	local streakLabel =
+		text(panel, "Streak", "Your streak: --", UDim2.fromScale(0.055, 0.12), UDim2.fromScale(0.89, 0.065), 29)
+	streakLabel.TextXAlignment = Enum.TextXAlignment.Left
+	local countdown = text(
+		panel,
+		"Countdown",
+		"Waiting for server state",
+		UDim2.fromScale(0.055, 0.19),
+		UDim2.fromScale(0.89, 0.05),
+		17
+	)
+	countdown.TextXAlignment = Enum.TextXAlignment.Left
+	countdown.TextColor3 = COLORS.muted
+
+	local calendar = Instance.new("ScrollingFrame")
+	calendar.Name = "Days"
+	calendar.Position = UDim2.fromScale(0.055, 0.275)
+	calendar.Size = UDim2.fromScale(0.89, 0.425)
+	calendar.BackgroundTransparency = 1
+	calendar.BorderSizePixel = 0
+	calendar.ScrollBarThickness = 4
+	calendar.ScrollBarImageColor3 = COLORS.muted
+	calendar.ScrollingDirection = Enum.ScrollingDirection.Y
+	calendar.CanvasSize = UDim2.fromScale(0, 0)
+	calendar.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	calendar.Parent = panel
+	local grid = Instance.new("UIGridLayout")
+	grid.SortOrder = Enum.SortOrder.LayoutOrder
+	grid.CellSize = UDim2.fromScale(0.235, 0.46)
+	grid.CellPadding = UDim2.fromScale(0.018, 0.045)
+	grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	grid.Parent = calendar
+
+	local status = text(panel, "Status", feedback, UDim2.fromScale(0.055, 0.725), UDim2.fromScale(0.89, 0.09), 17)
+	status.TextColor3 = COLORS.muted
+	local claim = button(panel, "Claim", "Connecting...", UDim2.fromScale(0.055, 0.835), UDim2.fromScale(0.89, 0.09))
+	text(
+		panel,
+		"InputHint",
+		"F7 / Y: toggle | Enter: claim | B: close",
+		UDim2.fromScale(0.055, 0.94),
+		UDim2.fromScale(0.89, 0.035),
+		12
+	).TextColor3 =
+		COLORS.muted
+
+	local launcher =
+		button(gui, "Launcher", "Daily rewards", UDim2.fromScale(0.025, 0.965), UDim2.fromScale(0.35, 0.075))
+	launcher.AnchorPoint = Vector2.new(0, 1)
+	local launcherLimit = Instance.new("UISizeConstraint")
+	launcherLimit.MinSize = Vector2.new(135, 42)
+	launcherLimit.MaxSize = Vector2.new(205, 52)
+	launcherLimit.Parent = launcher
+	close.NextSelectionDown = claim
+	claim.NextSelectionUp = close
+
+	local function connect(connection: RBXScriptConnection)
+		table.insert(connections, connection)
+	end
+
+	local function serverNow(): number
+		return DateTime.now().UnixTimestampMillis / 1000 + clockOffset
+	end
+
+	local function refresh()
+		if destroyed then
+			return
+		end
+		local packet = state
+		local ready = packet ~= nil and packet.canClaim
+		local checkable = packet ~= nil and not packet.canClaim and serverNow() >= packet.nextClaimAt
+		local enabled = not pending
+			and claimRemote ~= nil
+			and stateRemote ~= nil
+			and (ready or checkable or packet == nil)
+		claim.Active = enabled
+		claim.Selectable = enabled
+		claim.AutoButtonColor = enabled
+		claim.BackgroundColor3 = if enabled then COLORS.accent else COLORS.card
+		claim.TextColor3 = if enabled then COLORS.panel else COLORS.muted
+		if pending then
+			claim.Text = "Waiting for server..."
+		elseif claimRemote == nil or stateRemote == nil then
+			claim.Text = if feedbackIsError then "Rewards unavailable" else "Connecting..."
+		elseif packet == nil or checkable then
+			claim.Text = "Check availability"
+		elseif ready then
+			claim.Text = "Claim today's reward"
+		else
+			claim.Text = "Claimed for now"
+		end
+		status.Text = feedback
+		status.TextColor3 = if feedbackIsError then COLORS.warning else COLORS.muted
+		if packet then
+			streakLabel.Text = `Your streak: {packet.streak} {if packet.streak == 1 then "day" else "days"}`
+			if ready then
+				countdown.Text = `Day {packet.rewardIndex} is ready to claim`
+				countdown.TextColor3 = COLORS.ready
+			elseif checkable then
+				countdown.Text = "A new reward may be ready. Check availability."
+				countdown.TextColor3 = COLORS.ready
+			else
+				countdown.Text = `Next reward in {clockText(packet.nextClaimAt - serverNow())}`
+				countdown.TextColor3 = COLORS.muted
+			end
+			local cfg = config
+			if cfg then
+				local completed = if cfg.CycleMode == "Cap"
+					then math.min(packet.streak, cfg.CycleLength)
+					else if packet.streak == 0 then 0 else (packet.streak - 1) % cfg.CycleLength + 1
+				for index, card in cards do
+					local target = ready and index == packet.rewardIndex
+					local earned = not packet.streakBroken and index <= completed
+					if ready and cfg.CycleMode == "Loop" and packet.rewardIndex == 1 then
+						earned = false
+					end
+					card.frame.BackgroundColor3 = if target then Color3.fromRGB(33, 64, 82) else COLORS.card
+					card.stroke.Color = if target then COLORS.ready else COLORS.card
+					card.status.Text = if target then "READY" else if earned then "CLAIMED" else "UPCOMING"
+					card.status.TextColor3 = if target then COLORS.ready else COLORS.muted
+				end
+			end
+		end
+		if opened and GuiService.SelectedObject == claim and not enabled then
+			GuiService.SelectedObject = close
+		end
+	end
+
+	local function unavailable(message: string)
+		if destroyed then
+			return
+		end
+		feedback = message
+		feedbackIsError = true
+		pending = false
+		refresh()
+	end
+
+	local function sendRequest(isClaim: boolean)
+		if destroyed or pending then
+			return
+		end
+		local remote = if isClaim then claimRemote else stateRemote
+		if not remote then
+			return
+		end
+		if os.clock() - lastRequestAt < cooldown then
+			return
+		end
+		if isClaim and (state == nil or not state.canClaim) then
+			return
+		end
+		lastRequestAt = os.clock()
+		pending = true
+		requestVersion += 1
+		local version = requestVersion
+		feedback = if isClaim then "Claiming your reward..." else "Checking with the server..."
+		feedbackIsError = false
+		refresh()
+		remote:FireServer()
+		task.delay(RESPONSE_SECONDS, function()
+			if destroyed or not pending or requestVersion ~= version then
+				return
+			end
+			unavailable("The server did not reply. Check availability or try your claim again.")
+		end)
+	end
+
+	local function setOpen(value: boolean, manual: boolean)
+		if destroyed then
+			return
+		end
+		if manual then
+			manualInteraction = true
+		end
+		if value == opened then
+			return
+		end
+		opened = value
+		backdrop.Visible = value
+		launcher.Visible = not value
+		if value then
+			previousSelection = GuiService.SelectedObject
+			refresh()
+			if UserInputService.GamepadEnabled then
+				GuiService.SelectedObject = if claim.Selectable then claim else close
+			end
+			sendRequest(false)
+		else
+			local selected = GuiService.SelectedObject
+			if selected and selected:IsDescendantOf(gui) then
+				GuiService.SelectedObject = if previousSelection and previousSelection.Parent
+					then previousSelection
+					else if UserInputService.GamepadEnabled then launcher else nil
+			end
+		end
+	end
+
+	local handle: Handle
+	local function cleanup(removeGui: boolean)
+		if destroyed then
+			return
+		end
+		destroyed = true
+		requestVersion += 1
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+		ContextActionService:UnbindAction(TOGGLE_ACTION)
+		ContextActionService:UnbindAction(CLOSE_ACTION)
+		ContextActionService:UnbindAction(CLAIM_ACTION)
+		local selected = GuiService.SelectedObject
+		if selected and selected:IsDescendantOf(gui) then
+			GuiService.SelectedObject = if previousSelection and previousSelection.Parent
+				then previousSelection
+				else nil
+		end
+		if current == handle then
+			current = nil
+		end
+		if removeGui then
+			gui:Destroy()
+		end
+	end
+	handle = {
+		Open = function()
+			setOpen(true, true)
+		end,
+		Close = function()
+			setOpen(false, true)
+		end,
+		Destroy = function()
+			cleanup(true)
+		end,
+	}
+	current = handle
+	connect(launcher.Activated:Connect(handle.Open))
+	connect(close.Activated:Connect(handle.Close))
+	connect(claim.Activated:Connect(function()
+		local packet = state
+		sendRequest(packet ~= nil and packet.canClaim)
+	end))
+	connect(gui.Destroying:Connect(function()
+		cleanup(false)
+	end))
+	connect(gui.AncestryChanged:Connect(function()
+		if not gui:IsDescendantOf(playerGui) then
+			handle.Destroy()
+		end
+	end))
+
+	ContextActionService:BindAction(
+		TOGGLE_ACTION,
+		function(_actionName: string, inputState: Enum.UserInputState, _input: InputObject): Enum.ContextActionResult
+			if UserInputService:GetFocusedTextBox() then
+				return Enum.ContextActionResult.Pass
+			end
+			if inputState == Enum.UserInputState.Begin then
+				setOpen(not opened, true)
+			end
+			return Enum.ContextActionResult.Sink
+		end,
+		false,
+		Enum.KeyCode.F7,
+		Enum.KeyCode.ButtonY
+	)
+	ContextActionService:BindAction(
+		CLOSE_ACTION,
+		function(_actionName: string, inputState: Enum.UserInputState, _input: InputObject): Enum.ContextActionResult
+			if not opened then
+				return Enum.ContextActionResult.Pass
+			end
+			if inputState == Enum.UserInputState.Begin then
+				setOpen(false, true)
+			end
+			return Enum.ContextActionResult.Sink
+		end,
+		false,
+		Enum.KeyCode.ButtonB
+	)
+	ContextActionService:BindAction(
+		CLAIM_ACTION,
+		function(_actionName: string, inputState: Enum.UserInputState, _input: InputObject): Enum.ContextActionResult
+			if not opened or UserInputService:GetFocusedTextBox() then
+				return Enum.ContextActionResult.Pass
+			end
+			if inputState == Enum.UserInputState.Begin and claim.Active then
+				local packet = state
+				sendRequest(packet ~= nil and packet.canClaim)
+			end
+			return Enum.ContextActionResult.Sink
+		end,
+		false,
+		Enum.KeyCode.Return,
+		Enum.KeyCode.KeypadEnter
+	)
+
+	local elapsed = 0
+	connect(RunService.Heartbeat:Connect(function(deltaTime: number)
+		elapsed += deltaTime
+		if elapsed >= 1 then
+			elapsed = 0
+			if opened then
+				refresh()
+			end
+		end
+	end))
+	gui.Parent = playerGui
+	refresh()
+
+	task.spawn(function()
+		local function child(parent: Instance, name: string): Instance?
+			if destroyed then
+				return nil
+			end
+			return parent:WaitForChild(name, WAIT_SECONDS)
+		end
+		local kit = child(ReplicatedStorage, "StreakRewards")
+		local shared = if kit then child(kit, "Shared") else nil
+		local configModule = if shared then child(shared, "Config") else nil
+		local namesModule = if shared then child(shared, "Remotes") else nil
+		if destroyed then
+			return
+		end
+		if
+			not configModule
+			or not configModule:IsA("ModuleScript")
+			or not namesModule
+			or not namesModule:IsA("ModuleScript")
+		then
+			unavailable("Daily rewards could not load. Please rejoin or contact the game's support.")
+			return
+		end
+		local loadedConfig: ClientConfig? = nil
+		local loadedNames: RemoteNames? = nil
+		local ok, problem = pcall(function()
+			loadedConfig = require(configModule)
+			loadedNames = require(namesModule)
+		end)
+		local cfg = loadedConfig
+		local names = loadedNames
+		if not ok or not cfg or not names then
+			warn(`StreakRewards configuration failed to load: {tostring(problem)}`)
+			unavailable("Daily rewards configuration is unavailable.")
+			return
+		end
+		if destroyed then
+			return
+		end
+		config = cfg
+		cooldown = math.max(0.75, cfg.RemoteCooldownSeconds)
+		local columns = math.min(4, cfg.CycleLength)
+		grid.FillDirectionMaxCells = columns
+		grid.CellSize = UDim2.fromScale((1 - 0.018 * (columns - 1)) / columns - 0.005, 0.46)
+		for day = 1, cfg.CycleLength do
+			local reward = cfg.Rewards[day]
+			local card = Instance.new("Frame")
+			card.Name = `Day{day}`
+			card.LayoutOrder = day
+			card.BackgroundColor3 = COLORS.card
+			card.BorderSizePixel = 0
+			rounded(card, 0.08)
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = COLORS.card
+			stroke.Thickness = 2
+			stroke.Parent = card
+			text(card, "Day", `DAY {day}`, UDim2.fromScale(0.06, 0.06), UDim2.fromScale(0.88, 0.2), 15)
+			text(card, "Reward", reward.label, UDim2.fromScale(0.06, 0.3), UDim2.fromScale(0.88, 0.4), 20)
+			local dayStatus =
+				text(card, "Status", "UPCOMING", UDim2.fromScale(0.04, 0.76), UDim2.fromScale(0.92, 0.16), 12)
+			dayStatus.TextColor3 = COLORS.muted
+			card.Parent = calendar
+			table.insert(cards, { frame = card, status = dayStatus, stroke = stroke })
+		end
+		if cfg.NotifyOnJoin and not manualInteraction then
+			setOpen(true, false)
+		end
+		local folder = child(ReplicatedStorage, names.Folder)
+		local claimEvent = if folder then child(folder, names.ClaimRequest) else nil
+		local requestEvent = if folder then child(folder, names.StateRequest) else nil
+		local updateEvent = if folder then child(folder, names.StateUpdate) else nil
+		if destroyed then
+			return
+		end
+		if
+			not claimEvent
+			or not claimEvent:IsA("RemoteEvent")
+			or not requestEvent
+			or not requestEvent:IsA("RemoteEvent")
+			or not updateEvent
+			or not updateEvent:IsA("RemoteEvent")
+		then
+			unavailable("Daily rewards are unavailable on this server. Please try another server.")
+			return
+		end
+		claimRemote = claimEvent
+		stateRemote = requestEvent
+		connect(updateEvent.OnClientEvent:Connect(function(packet: StatePacket)
+			if destroyed then
+				return
+			end
+			state = packet
+			clockOffset = packet.serverTime - DateTime.now().UnixTimestampMillis / 1000
+			pending = false
+			requestVersion += 1
+			feedback = packet.message
+				or (
+					if packet.canClaim
+						then "Your next daily reward is ready."
+						else "Come back for your next daily reward."
+				)
+			feedbackIsError = false
+			refresh()
+		end))
+		sendRequest(false)
+	end)
+
+	return handle
+end
+
+return Controller
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="StringValue" referent="4">
+      <Properties>
+        <string name="Name">INSTALL</string>
+        <string name="Value">StreakRewards 1.0.0 | Move Shared into ReplicatedStorage &gt; Folder named StreakRewards. Move Server into ServerScriptService and rename StreakRewardsServer. Move Client into StarterPlayer &gt; StarterPlayerScripts and rename StreakRewardsClient. Delete this package wrapper after moving folders. No Installer Script runs. Read README.md for persistence, configuration, reward delivery and the MIT license.</string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="5">
+      <Properties>
+        <string name="Name">Server</string>
+      </Properties>
+      <Item class="Script" referent="6">
+        <Properties>
+          <string name="Name">Bootstrap</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[--!strict
+
+local StreakRewards = require(script.Parent:WaitForChild("StreakRewards"))
+
+StreakRewards.Start()
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="7">
+        <Properties>
+          <string name="Name">DataStoreAdapter</string>
+          <string name="Source"><![CDATA[--!strict
+
+local DataStoreService = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Shared = ReplicatedStorage:WaitForChild("StreakRewards"):WaitForChild("Shared")
+local Types = require(Shared:WaitForChild("Types"))
+local RecordCodec = require(script.Parent:WaitForChild("RecordCodec"))
+
+type Config = Types.Config
+type Record = Types.Record
+type Adapter = Types.Adapter
+
+type Backend = "Unknown" | "Live" | "Studio"
+
+local DataStoreAdapter = {}
+
+local function apiDisabledInStudio(message: string): boolean
+	local lower = string.lower(message)
+	return string.find(lower, "studioaccesstoapisnotallowed", 1, true) ~= nil
+		or (
+			string.find(lower, "studio", 1, true) ~= nil
+			and string.find(lower, "api", 1, true) ~= nil
+			and (
+				string.find(lower, "not enabled", 1, true) ~= nil
+				or string.find(lower, "not allowed", 1, true) ~= nil
+				or string.find(lower, "disabled", 1, true) ~= nil
+			)
+		)
+end
+
+function DataStoreAdapter.new(config: Config): Adapter
+	local store = DataStoreService:GetDataStore(config.DataStoreName)
+	local studio = RunService:IsStudio()
+	local random = Random.new()
+	local backend: Backend = "Unknown"
+	local memory: { [number]: Record } = {}
+
+	local function key(userId: number): string
+		return `User_{userId}`
+	end
+
+	-- Only the initial, explicit Studio API-disabled error enables memory mode.
+	-- A live adapter never changes backend after a successful cloud operation.
+	local function request(operation: () -> any, callbackFailure: (() -> string?)?): (any, boolean)
+		local failure = "DataStore request failed"
+		for attempt = 1, config.RetryAttempts do
+			local ok, result = pcall(operation)
+			if ok then
+				if backend == "Studio" then
+					error("StreakRewards concurrent Studio requests selected inconsistent storage backends", 0)
+				end
+				backend = "Live"
+				return result, false
+			end
+
+			failure = tostring(result)
+			if callbackFailure then
+				local transformFailure = callbackFailure()
+				if transformFailure then
+					error(transformFailure, 0)
+				end
+			end
+			if studio and backend == "Unknown" and apiDisabledInStudio(failure) then
+				backend = "Studio"
+				warn("StreakRewards: Studio API access is disabled; using non-persistent session data.")
+				return nil, true
+			end
+			if studio and backend == "Studio" then
+				if apiDisabledInStudio(failure) then
+					return nil, true
+				end
+				error(`StreakRewards persistence unavailable: {failure}`, 0)
+			end
+			if attempt < config.RetryAttempts then
+				local delaySeconds = math.min(config.RetryBaseSeconds * 2 ^ (attempt - 1), 30)
+				task.wait(delaySeconds * random:NextNumber(0.75, 1.25))
+			end
+		end
+		error(`StreakRewards persistence unavailable: {failure}`, 0)
+	end
+
+	local adapter: Adapter
+	adapter = {
+		Load = function(userId: number): Record
+			if backend == "Studio" then
+				return RecordCodec.Copy(memory[userId] or RecordCodec.New(config.StreakFreeze))
+			end
+
+			local value, fallback = request(function(): any
+				return store:GetAsync(key(userId))
+			end, nil)
+			if fallback then
+				return RecordCodec.Copy(memory[userId] or RecordCodec.New(config.StreakFreeze))
+			end
+			return RecordCodec.Decode(value, config.StreakFreeze)
+		end,
+
+		Update = function(userId: number, transform: (Record) -> Record): Record
+			local function memoryUpdate(): Record
+				local current = RecordCodec.Copy(memory[userId] or RecordCodec.New(config.StreakFreeze))
+				local updated = RecordCodec.Decode(transform(current), config.StreakFreeze)
+				memory[userId] = updated
+				return RecordCodec.Copy(updated)
+			end
+
+			if backend == "Studio" then
+				return memoryUpdate()
+			end
+
+			local transformFailure: string? = nil
+			local value, fallback = request(function(): any
+				transformFailure = nil
+				return store:UpdateAsync(key(userId), function(current: any): any
+					-- UpdateAsync may invoke this more than once. The transform must
+					-- not yield, send events, pay rewards, or mutate external state.
+					local ok, updated = pcall(function(): Record
+						local decoded = RecordCodec.Decode(current, config.StreakFreeze)
+						return RecordCodec.Decode(transform(decoded), config.StreakFreeze)
+					end)
+					if not ok then
+						transformFailure = tostring(updated)
+						error(transformFailure, 0)
+					end
+					return updated
+				end)
+			end, function(): string?
+				return transformFailure
+			end)
+			if fallback then
+				return memoryUpdate()
+			end
+			return RecordCodec.Decode(value, config.StreakFreeze)
+		end,
+
+		-- Re-read through UpdateAsync. Never replay a stale Load result on leave.
+		Save = function(userId: number): ()
+			adapter.Update(userId, function(current: Record): Record
+				return current
+			end)
+		end,
+
+		-- This adapter holds no session locks. Studio data survives a rejoin.
+		Release = function(_userId: number): () end,
+	}
+
+	return adapter
+end
+
+return DataStoreAdapter
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="8">
+        <Properties>
+          <string name="Name">RecordCodec</string>
+          <string name="Source"><![CDATA[--!strict
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Shared = ReplicatedStorage:WaitForChild("StreakRewards"):WaitForChild("Shared")
+local Types = require(Shared:WaitForChild("Types"))
+
+type Record = Types.Record
+
+local RecordCodec = {}
+RecordCodec.Version = 1
+
+local MAX_SAFE_INTEGER = 9007199254740991
+
+local function integer(value: any, name: string): number
+	if type(value) ~= "number" or value ~= value or value < 0 or value > MAX_SAFE_INTEGER or value % 1 ~= 0 then
+		error(`StreakRewards record has an invalid {name}`, 3)
+	end
+	return value
+end
+
+function RecordCodec.New(freezeAvailable: boolean): Record
+	return {
+		version = RecordCodec.Version,
+		lastClaimTime = 0,
+		streak = 0,
+		freezeAvailable = freezeAvailable,
+	}
+end
+
+function RecordCodec.Decode(value: any, initialFreeze: boolean): Record
+	if value == nil then
+		return RecordCodec.New(initialFreeze)
+	end
+	if type(value) ~= "table" then
+		error("StreakRewards record must be a table", 2)
+	end
+
+	local version = value.version
+	if version == nil then
+		version = 0
+	end
+	version = integer(version, "version")
+	if version > RecordCodec.Version then
+		error("StreakRewards record uses a newer schema; refusing to overwrite it", 2)
+	end
+
+	-- Version 0 stored the same timestamp and streak without a freeze field.
+	-- A malformed existing record is never treated as a new player.
+	local lastClaimTime = integer(value.lastClaimTime, "lastClaimTime")
+	local streak = integer(value.streak, "streak")
+	if (lastClaimTime == 0) ~= (streak == 0) then
+		error("StreakRewards record timestamp and streak disagree", 2)
+	end
+
+	local freezeAvailable = value.freezeAvailable
+	if version == 0 and freezeAvailable == nil then
+		freezeAvailable = initialFreeze
+	end
+	if type(freezeAvailable) ~= "boolean" then
+		error("StreakRewards record has an invalid freezeAvailable", 2)
+	end
+
+	return {
+		version = RecordCodec.Version,
+		lastClaimTime = lastClaimTime,
+		streak = streak,
+		freezeAvailable = freezeAvailable,
+	}
+end
+
+function RecordCodec.Copy(record: Record): Record
+	return {
+		version = record.version,
+		lastClaimTime = record.lastClaimTime,
+		streak = record.streak,
+		freezeAvailable = record.freezeAvailable,
+	}
+end
+
+function RecordCodec.Equal(left: Record, right: Record): boolean
+	return left.version == right.version
+		and left.lastClaimTime == right.lastClaimTime
+		and left.streak == right.streak
+		and left.freezeAvailable == right.freezeAvailable
+end
+
+return RecordCodec
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
+        <Properties>
+          <string name="Name">StreakRewards</string>
+          <string name="Source"><![CDATA[--!strict
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Shared = ReplicatedStorage:WaitForChild("StreakRewards"):WaitForChild("Shared")
+local Types = require(Shared:WaitForChild("Types"))
+local Config: Types.Config = require(Shared:WaitForChild("Config"))
+local RemoteNames = require(Shared:WaitForChild("Remotes"))
+local StreakLogic = require(Shared:WaitForChild("StreakLogic"))
+local DataStoreAdapter = require(script.Parent:WaitForChild("DataStoreAdapter"))
+local RecordCodec = require(script.Parent:WaitForChild("RecordCodec"))
+
+export type Reward = Types.Reward
+export type Record = Types.Record
+export type Adapter = Types.Adapter
+export type StatePacket = Types.StatePacket
+export type RewardHandler = (Player, Reward, string) -> ()
+export type API = {
+	Claimed: RBXScriptSignal,
+	GetState: (Player) -> StatePacket?,
+	SetRewardHandler: (RewardHandler) -> (),
+	SetAdapter: (Adapter) -> (),
+	ResetPlayer: (Player) -> boolean,
+	Start: () -> (),
+}
+
+type Session = {
+	player: Player,
+	record: Record?,
+	available: boolean,
+	busy: boolean,
+	closing: boolean,
+	releasing: boolean,
+	lastClaimRequest: number,
+	lastStateRequest: number,
+}
+
+local StreakRewards = {}
+local claimedEvent = Instance.new("BindableEvent")
+claimedEvent.Name = "StreakRewardsClaimed"
+StreakRewards.Claimed = claimedEvent.Event
+
+local sessions: { [number]: Session } = {}
+local joining: { [Player]: boolean } = {}
+local adapter: Adapter? = nil
+local rewardHandler: RewardHandler? = nil
+local stateUpdate: RemoteEvent? = nil
+local started = false
+local shuttingDown = false
+local pendingLoads = 0
+
+local function requireAdapter(): Adapter
+	local current = adapter
+	assert(current ~= nil, "StreakRewards.Start() must be called first")
+	return current
+end
+
+local function sessionState(session: Session, message: string?): StatePacket?
+	local record = session.record
+	if not session.available or record == nil or session.closing then
+		return nil
+	end
+
+	local now = os.time()
+	local state = StreakLogic.compute(record.lastClaimTime, record.streak, now, Config, record.freezeAvailable)
+	return {
+		canClaim = state.canClaim,
+		nextClaimAt = state.nextClaimAt,
+		newStreak = state.newStreak,
+		rewardIndex = state.rewardIndex,
+		streakBroken = state.streakBroken,
+		streak = record.streak,
+		serverTime = now,
+		message = message,
+	}
+end
+
+local function sendState(session: Session, message: string?): ()
+	local remote = stateUpdate
+	if remote == nil or session.closing or session.player.Parent ~= Players then
+		return
+	end
+	local packet = sessionState(session, message)
+	if packet == nil then
+		packet = {
+			canClaim = false,
+			nextClaimAt = 0,
+			newStreak = 0,
+			rewardIndex = 1,
+			streakBroken = false,
+			streak = 0,
+			serverTime = os.time(),
+			message = message or "Rewards data is unavailable. Please rejoin before claiming.",
+		}
+	end
+	remote:FireClient(session.player, packet)
+end
+
+local function finite(value: number): boolean
+	return value == value and value > -math.huge and value < math.huge
+end
+
+local function deliverDefault(player: Player, reward: Reward): ()
+	if reward.kind == "Custom" then
+		error("Custom rewards require StreakRewards.SetRewardHandler", 2)
+	end
+
+	if reward.kind == "Attribute" then
+		local current = player:GetAttribute(reward.name)
+		if current == nil then
+			current = 0
+		end
+		if type(current) ~= "number" or not finite(current) or not finite(current + reward.amount) then
+			error(`Currency attribute {reward.name} must be a finite number`, 2)
+		end
+		player:SetAttribute(reward.name, current + reward.amount)
+		return
+	end
+
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if leaderstats == nil then
+		local folder = Instance.new("Folder")
+		folder.Name = "leaderstats"
+		folder.Parent = player
+		leaderstats = folder
+	elseif not leaderstats:IsA("Folder") then
+		error("Existing leaderstats must be a Folder", 2)
+	end
+
+	local stat = leaderstats:FindFirstChild(reward.name)
+	if stat == nil then
+		local value = Instance.new("NumberValue")
+		value.Name = reward.name
+		value.Value = reward.amount
+		value.Parent = leaderstats
+		return
+	end
+	if not stat:IsA("NumberValue") and not stat:IsA("IntValue") then
+		error(`Leaderstat {reward.name} must be a NumberValue or IntValue`, 2)
+	end
+	local nextValue = stat.Value + reward.amount
+	if not finite(stat.Value) or not finite(nextValue) then
+		error(`Leaderstat {reward.name} must be finite`, 2)
+	end
+	if stat:IsA("IntValue") and nextValue % 1 ~= 0 then
+		error(`Leaderstat {reward.name} cannot store a fractional reward`, 2)
+	end
+	stat.Value = nextValue
+end
+
+local function closeSession(session: Session): ()
+	if session.releasing then
+		return
+	end
+	session.releasing = true
+	session.closing = true
+	-- The lock covers persistence and delivery. Leave and shutdown cannot save
+	-- or release a profile while its claim or reset is still running.
+	while session.busy do
+		task.wait()
+	end
+	session.busy = true
+	local currentAdapter = requireAdapter()
+	if session.record ~= nil then
+		local saved, saveError = pcall(currentAdapter.Save, session.player.UserId)
+		if not saved then
+			warn(`StreakRewards save failed for {session.player.UserId}: {tostring(saveError)}`)
+		end
+	end
+	local released, releaseError = pcall(currentAdapter.Release, session.player.UserId)
+	if not released then
+		warn(`StreakRewards release failed for {session.player.UserId}: {tostring(releaseError)}`)
+	end
+	session.record = nil
+	session.available = false
+	session.busy = false
+	if sessions[session.player.UserId] == session then
+		sessions[session.player.UserId] = nil
+	end
+end
+
+local function beginJoin(player: Player): ()
+	if shuttingDown or joining[player] then
+		return
+	end
+	local currentSession = sessions[player.UserId]
+	if currentSession and currentSession.player == player then
+		return
+	end
+	joining[player] = true
+	pendingLoads += 1
+	task.spawn(function(): ()
+		-- A fast rejoin waits for the prior session's claim and release.
+		while sessions[player.UserId] ~= nil and not shuttingDown and player.Parent == Players do
+			task.wait()
+		end
+		if shuttingDown or player.Parent ~= Players then
+			joining[player] = nil
+			pendingLoads -= 1
+			return
+		end
+
+		local session: Session = {
+			player = player,
+			record = nil,
+			available = false,
+			busy = true,
+			closing = false,
+			releasing = false,
+			lastClaimRequest = -math.huge,
+			lastStateRequest = -math.huge,
+		}
+		sessions[player.UserId] = session
+		local currentAdapter = requireAdapter()
+		local loaded, result = pcall(function(): Record
+			return RecordCodec.Decode(currentAdapter.Load(player.UserId), Config.StreakFreeze)
+		end)
+		if loaded then
+			session.record = result
+			session.available = true
+		else
+			warn(`StreakRewards load failed for {player.UserId}: {tostring(result)}`)
+		end
+		session.busy = false
+		joining[player] = nil
+		pendingLoads -= 1
+
+		if session.closing or shuttingDown or player.Parent ~= Players then
+			closeSession(session)
+			return
+		end
+		if loaded then
+			local packet = sessionState(session, nil)
+			local message = if Config.NotifyOnJoin
+					and packet
+					and packet.canClaim
+				then "Your daily reward is ready."
+				else nil
+			sendState(session, message)
+		else
+			sendState(session, "Rewards data could not be loaded. Please rejoin before claiming.")
+		end
+	end)
+end
+
+local function rateLimited(session: Session, action: "Claim" | "State"): boolean
+	local now = os.clock()
+	local previous = if action == "Claim" then session.lastClaimRequest else session.lastStateRequest
+	if now - previous < Config.RemoteCooldownSeconds then
+		return true
+	end
+	if action == "Claim" then
+		session.lastClaimRequest = now
+	else
+		session.lastStateRequest = now
+	end
+	return false
+end
+
+local function claim(session: Session): ()
+	if shuttingDown or session.closing then
+		return
+	end
+	if session.busy then
+		sendState(session, "A rewards operation is already in progress.")
+		return
+	end
+	if not session.available or session.record == nil then
+		sendState(session, "Rewards data is unavailable. Please rejoin before claiming.")
+		return
+	end
+
+	session.busy = true
+	local currentAdapter = requireAdapter()
+	local now = os.time()
+	local handler = rewardHandler
+	local receipt = HttpService:GenerateGUID(false)
+	local candidate: Record? = nil
+	local selectedReward: Reward? = nil
+	local missingHandler = false
+
+	local persisted, result = pcall(function(): Record
+		local committed = currentAdapter.Update(session.player.UserId, function(stored: Record): Record
+			-- Only transaction-local bookkeeping changes here. UpdateAsync can
+			-- re-run this callback, including after a conflicted or uncertain write.
+			candidate = nil
+			selectedReward = nil
+			missingHandler = false
+			local record = RecordCodec.Decode(stored, Config.StreakFreeze)
+			local state = StreakLogic.compute(record.lastClaimTime, record.streak, now, Config, record.freezeAvailable)
+			if not state.canClaim then
+				return record
+			end
+			local reward = Config.Rewards[state.rewardIndex]
+			if reward.kind == "Custom" and handler == nil then
+				missingHandler = true
+				return record
+			end
+
+			local withoutFreeze = StreakLogic.compute(record.lastClaimTime, record.streak, now, Config, false)
+			local consumedFreeze = Config.StreakFreeze and record.freezeAvailable and withoutFreeze.streakBroken
+			local nextRecord: Record = {
+				version = RecordCodec.Version,
+				lastClaimTime = now,
+				streak = state.newStreak,
+				freezeAvailable = record.freezeAvailable and not consumedFreeze,
+			}
+			candidate = nextRecord
+			selectedReward = reward
+			return nextRecord
+		end)
+		return RecordCodec.Decode(committed, Config.StreakFreeze)
+	end)
+
+	if not persisted then
+		-- An error can follow a committed write. Never pay or blindly replay it.
+		session.available = false
+		session.busy = false
+		warn(`StreakRewards claim persistence failed for {session.player.UserId}: {tostring(result)}`)
+		sendState(
+			session,
+			"Your claim could not be confirmed. No reward was delivered; please rejoin. A claim may already have been recorded."
+		)
+		return
+	end
+
+	local committed: Record = result
+	session.record = committed
+	local accepted = candidate
+	local reward = selectedReward
+	if accepted == nil or reward == nil then
+		session.busy = false
+		if missingHandler then
+			warn(`StreakRewards Custom reward has no handler for {session.player.UserId}`)
+			sendState(session, "This reward is not configured. No claim was consumed; please contact the developer.")
+		else
+			sendState(session, "You have already claimed. Check the countdown for your next reward.")
+		end
+		return
+	end
+	if not RecordCodec.Equal(accepted, committed) then
+		session.available = false
+		session.busy = false
+		warn(`StreakRewards adapter returned a mismatched committed claim for {session.player.UserId}`)
+		sendState(session, "Your claim could not be confirmed. No reward was delivered; please rejoin.")
+		return
+	end
+
+	-- Persistence and an external economy cannot commit atomically. This GUID
+	-- identifies this delivery attempt, not a crash-recoverable payout journal.
+	local delivered, deliveryError = pcall(function(): ()
+		if handler then
+			handler(session.player, reward, receipt)
+		else
+			deliverDefault(session.player, reward)
+		end
+	end)
+	if not delivered then
+		warn(`StreakRewards delivery failed for {session.player.UserId}; receipt {receipt}: {tostring(deliveryError)}`)
+		session.busy = false
+		sendState(
+			session,
+			"Your claim was recorded, but reward delivery failed. Please contact the developer; do not claim again."
+		)
+		return
+	end
+
+	claimedEvent:Fire(session.player, reward, committed.streak)
+	session.busy = false
+	sendState(session, `Claimed {reward.label}.`)
+end
+
+function StreakRewards.GetState(player: Player): StatePacket?
+	local session = sessions[player.UserId]
+	if session == nil or session.player ~= player then
+		return nil
+	end
+	return sessionState(session, nil)
+end
+
+function StreakRewards.SetRewardHandler(handler: RewardHandler): ()
+	assert(type(handler) == "function", "Reward handler must be a function")
+	rewardHandler = handler
+end
+
+function StreakRewards.SetAdapter(customAdapter: Adapter): ()
+	assert(not started, "SetAdapter must be called before Start")
+	assert(type(customAdapter) == "table", "Adapter must be a table")
+	assert(type(customAdapter.Load) == "function", "Adapter.Load is required")
+	assert(type(customAdapter.Update) == "function", "Adapter.Update is required")
+	assert(type(customAdapter.Save) == "function", "Adapter.Save is required")
+	assert(type(customAdapter.Release) == "function", "Adapter.Release is required")
+	adapter = customAdapter
+end
+
+function StreakRewards.ResetPlayer(player: Player): boolean
+	local session = sessions[player.UserId]
+	if session == nil or session.player ~= player or shuttingDown or session.closing then
+		return false
+	end
+	while session.busy do
+		task.wait()
+		if shuttingDown or session.closing or sessions[player.UserId] ~= session then
+			return false
+		end
+	end
+	if not session.available or session.record == nil then
+		return false
+	end
+	session.busy = true
+	local currentAdapter = requireAdapter()
+	local resetRecord = RecordCodec.New(Config.StreakFreeze)
+	local saved, result = pcall(function(): Record
+		return RecordCodec.Decode(
+			currentAdapter.Update(player.UserId, function(stored: Record): Record
+				RecordCodec.Decode(stored, Config.StreakFreeze)
+				return RecordCodec.Copy(resetRecord)
+			end),
+			Config.StreakFreeze
+		)
+	end)
+	if not saved or not RecordCodec.Equal(result, resetRecord) then
+		session.available = false
+		session.busy = false
+		warn(`StreakRewards reset failed for {player.UserId}: {tostring(result)}`)
+		sendState(session, "Your rewards reset could not be confirmed. Please rejoin before claiming.")
+		return false
+	end
+	session.record = result
+	session.busy = false
+	sendState(session, "Your streak was reset.")
+	return true
+end
+
+local function getRemote(folder: Folder, name: string): RemoteEvent
+	local existing = folder:FindFirstChild(name)
+	if existing then
+		assert(existing:IsA("RemoteEvent"), `StreakRewards remote {name} must be a RemoteEvent`)
+		return existing
+	end
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = name
+	remote.Parent = folder
+	return remote
+end
+
+function StreakRewards.Start(): ()
+	if started then
+		return
+	end
+	if adapter == nil then
+		adapter = DataStoreAdapter.new(Config)
+	end
+
+	local existing = ReplicatedStorage:FindFirstChild(RemoteNames.Folder)
+	local folder: Folder
+	if existing then
+		assert(existing:IsA("Folder"), "StreakRewards remotes container must be a Folder")
+		folder = existing
+	else
+		folder = Instance.new("Folder")
+		folder.Name = RemoteNames.Folder
+		folder.Parent = ReplicatedStorage
+	end
+	local claimRequest = getRemote(folder, RemoteNames.ClaimRequest)
+	local stateRequest = getRemote(folder, RemoteNames.StateRequest)
+	stateUpdate = getRemote(folder, RemoteNames.StateUpdate)
+	started = true
+
+	claimRequest.OnServerEvent:Connect(function(player: Player, ...: any): ()
+		local session = sessions[player.UserId]
+		if session == nil or session.player ~= player or rateLimited(session, "Claim") then
+			return
+		end
+		-- The authenticated sender is the only accepted input. No client time,
+		-- streak, reward, receipt, target player, or payload is trusted.
+		if select("#", ...) ~= 0 then
+			return
+		end
+		claim(session)
+	end)
+	stateRequest.OnServerEvent:Connect(function(player: Player, ...: any): ()
+		local session = sessions[player.UserId]
+		if session == nil or session.player ~= player or rateLimited(session, "State") then
+			return
+		end
+		if select("#", ...) ~= 0 then
+			return
+		end
+		sendState(session, if session.busy and session.record == nil then "Loading rewards data..." else nil)
+	end)
+
+	Players.PlayerAdded:Connect(beginJoin)
+	Players.PlayerRemoving:Connect(function(player: Player): ()
+		local session = sessions[player.UserId]
+		if session and session.player == player then
+			closeSession(session)
+		end
+	end)
+	game:BindToClose(function(): ()
+		shuttingDown = true
+		for _, session in sessions do
+			task.spawn(closeSession, session)
+		end
+		-- Roblox owns the shutdown deadline. Do not drop an in-flight claim or
+		-- release its profile early to meet a shorter, artificial timeout.
+		while pendingLoads > 0 or next(sessions) ~= nil do
+			task.wait()
+		end
+	end)
+
+	for _, player in Players:GetPlayers() do
+		beginJoin(player)
+	end
+end
+
+return StreakRewards
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="10">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="ModuleScript" referent="11">
+        <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[--!strict
+
+local Types = require(script.Parent.Types)
+
+local config: Types.Config = {
+	CycleLength = 7,
+	CycleMode = "Loop",
+	TimeMode = "UTC",
+	GracePeriodHours = 0,
+	StreakFreeze = false,
+	NotifyOnJoin = true,
+	DataStoreName = "StreakRewards_v1",
+	RetryAttempts = 4,
+	RetryBaseSeconds = 0.5,
+	RemoteCooldownSeconds = 1,
+	Rewards = {
+		{ kind = "Attribute", name = "Coins", amount = 100, label = "100 Coins" },
+		{ kind = "Attribute", name = "Coins", amount = 150, label = "150 Coins" },
+		{ kind = "Attribute", name = "Coins", amount = 200, label = "200 Coins" },
+		{ kind = "Attribute", name = "Coins", amount = 250, label = "250 Coins" },
+		{ kind = "Attribute", name = "Coins", amount = 300, label = "300 Coins" },
+		{ kind = "Attribute", name = "Coins", amount = 400, label = "400 Coins" },
+		{ kind = "Attribute", name = "Coins", amount = 750, label = "750 Coins" },
+	},
+}
+
+return config
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="12">
+        <Properties>
+          <string name="Name">Remotes</string>
+          <string name="Source"><![CDATA[--!strict
+
+return table.freeze({
+	Folder = "StreakRewardsRemotes",
+	ClaimRequest = "ClaimRequest",
+	StateRequest = "StateRequest",
+	StateUpdate = "StateUpdate",
+})
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
+          <string name="Name">StreakLogic</string>
+          <string name="Source"><![CDATA[--!strict
+
+export type Config = {
+	CycleLength: number,
+	CycleMode: "Loop" | "Cap",
+	TimeMode: "UTC" | "Rolling",
+	GracePeriodHours: number,
+	StreakFreeze: boolean,
+}
+
+export type ClaimState = {
+	canClaim: boolean,
+	nextClaimAt: number,
+	newStreak: number,
+	rewardIndex: number,
+	streakBroken: boolean,
+}
+
+local SECONDS_PER_DAY = 86400
+local SECONDS_PER_HOUR = 3600
+
+local function rewardIndex(streak: number, config: Config): number
+	local positiveStreak = math.max(1, streak)
+	if config.CycleMode == "Loop" then
+		return (positiveStreak - 1) % config.CycleLength + 1
+	end
+	return math.min(positiveStreak, config.CycleLength)
+end
+
+local function compute(
+	lastClaimTime: number,
+	streak: number,
+	now: number,
+	config: Config,
+	freezeAvailable: boolean?
+): ClaimState
+	if lastClaimTime == 0 then
+		return {
+			canClaim = true,
+			nextClaimAt = now,
+			newStreak = 1,
+			rewardIndex = 1,
+			streakBroken = false,
+		}
+	end
+
+	local nextClaimAt = if config.TimeMode == "UTC"
+		then math.floor(lastClaimTime / SECONDS_PER_DAY) * SECONDS_PER_DAY + SECONDS_PER_DAY
+		else lastClaimTime + SECONDS_PER_DAY
+
+	if now < lastClaimTime or now < nextClaimAt then
+		return {
+			canClaim = false,
+			nextClaimAt = nextClaimAt,
+			newStreak = streak,
+			rewardIndex = rewardIndex(streak, config),
+			streakBroken = false,
+		}
+	end
+
+	local deadline = nextClaimAt + SECONDS_PER_DAY + config.GracePeriodHours * SECONDS_PER_HOUR
+	local streakBroken = now > deadline and not (config.StreakFreeze and freezeAvailable == true)
+	local newStreak = if streakBroken then 1 else streak + 1
+
+	return {
+		canClaim = true,
+		nextClaimAt = nextClaimAt,
+		newStreak = newStreak,
+		rewardIndex = rewardIndex(newStreak, config),
+		streakBroken = streakBroken,
+	}
+end
+
+return table.freeze({
+	compute = compute,
+})
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="14">
+        <Properties>
+          <string name="Name">Types</string>
+          <string name="Source"><![CDATA[--!strict
+
+export type Reward = {
+	kind: "Attribute" | "Leaderstats" | "Custom",
+	name: string,
+	amount: number,
+	label: string,
+}
+
+export type Config = {
+	CycleLength: number,
+	CycleMode: "Loop" | "Cap",
+	TimeMode: "UTC" | "Rolling",
+	GracePeriodHours: number,
+	StreakFreeze: boolean,
+	NotifyOnJoin: boolean,
+	Rewards: { Reward },
+	DataStoreName: string,
+	RetryAttempts: number,
+	RetryBaseSeconds: number,
+	RemoteCooldownSeconds: number,
+}
+
+export type Record = {
+	version: number,
+	lastClaimTime: number,
+	streak: number,
+	freezeAvailable: boolean,
+}
+
+export type ClaimState = {
+	canClaim: boolean,
+	nextClaimAt: number,
+	newStreak: number,
+	rewardIndex: number,
+	streakBroken: boolean,
+}
+
+export type StatePacket = {
+	canClaim: boolean,
+	nextClaimAt: number,
+	newStreak: number,
+	rewardIndex: number,
+	streakBroken: boolean,
+	streak: number,
+	serverTime: number,
+	message: string?,
+}
+
+export type Adapter = {
+	Load: (userId: number) -> Record,
+	Update: (userId: number, transform: (Record) -> Record) -> Record,
+	Save: (userId: number) -> (),
+	Release: (userId: number) -> (),
+}
+
+return {}
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+</roblox>

@@ -1,0 +1,26 @@
+{
+  "name": "StreakRewards-Demo",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "StreakRewards": {
+        "$className": "Folder",
+        "Shared": { "$path": "src/Shared" }
+      }
+    },
+    "ServerScriptService": {
+      "StreakRewardsServer": { "$path": "src/Server" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "StreakRewardsClient": { "$path": "src/Client" }
+      }
+    },
+    "Workspace": {
+      "SpawnLocation": {
+        "$className": "SpawnLocation",
+        "$properties": { "Anchored": true, "Size": [12, 1, 12], "Position": [0, 0, 0], "Neutral": true }
+      }
+    }
+  }
+}
