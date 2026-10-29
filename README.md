@@ -207,6 +207,10 @@ This project is free and MIT-licensed. If it saved you time, an optional tip is 
 
 Please only send SOL or Solana-network USDC to this address. Tips are voluntary and do not buy support, priority or any license rights.
 
+**EVM (Ethereum, Optimism, Base, Arbitrum, Polygon):** `0xF4C46D4D4747d14193e7Dad4eadbf544CFe74Bb0`
+
+**Drips:** this repo has a [`FUNDING.json`](FUNDING.json) so it can receive streams/splits on [Drips](https://www.drips.network/app/projects/github/kensondev/roblox-streak-rewards).
+
 ## License
 
 [MIT](./LICENSE) © 2026 Kenson (kensondev)

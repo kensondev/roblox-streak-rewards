@@ -1,0 +1,13 @@
+{
+  "drips": {
+    "ethereum": {
+      "ownedBy": "0xF4C46D4D4747d14193e7Dad4eadbf544CFe74Bb0"
+    },
+    "optimism": {
+      "ownedBy": "0xF4C46D4D4747d14193e7Dad4eadbf544CFe74Bb0"
+    },
+    "filecoin": {
+      "ownedBy": "0xF4C46D4D4747d14193e7Dad4eadbf544CFe74Bb0"
+    }
+  }
+}
